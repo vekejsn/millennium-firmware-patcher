@@ -115,10 +115,20 @@ def mtr2_input_shape(chips):
     return [len(chip) for chip in chips] in ([0x100000], [0x80000, 0x80000])
 
 
+def is_demo_rom(rom):
+    # Production NLA1X06 shares the demo's firmware header. Check its menu
+    # text in the control ROM rather than the filename or version label.
+    control = rom[:0xc0000]
+    return bool(len(rom) == 0x100000 and b'Set Demo OptionsUse 1= DO IT, *=NEXT' in control
+                and b'Set Demo Type  Use 1= DO IT, *=NEXT' in control)
+
+
 def patch_discovered(chips, *, require_mtr2=False):
 
     if mtr2_input_shape(chips):
         stock = b''.join(chips)
+        if is_demo_rom(stock):
+            raise ValueError('demo firmware is excluded from patching')
         board, layout = 'mtr2', discover_mtr2(stock)
     elif not require_mtr2 and list(map(len, chips)) == [0x40000]:
         stock = chips[0]
@@ -237,18 +247,31 @@ def discover(rom):
 
     # Use padding at the end of common ROM, not interior runs (which can be tables).
     end_padding = ba - len(rom[:ba].rstrip(b'\0'))
-    if end_padding >= 336:
-        origin = (ba - end_padding + 15) & ~15
-    else:
-        # CNB-family common ROM has a documented free window here, also
-        # used by the earlier modem shims. Do not pick arbitrary interior zeros.
-        if not (ring['ring_on'] == 0x2624D and bank_call == 0x43FB):
-            raise ValueError('no sufficiently large common-ROM tail padding')
-        origin = 0x1360
-        if any(rom[origin:origin + 322]):
-            raise ValueError('CNB common-ROM window occupied')
+    origin = (ba - end_padding + 15) & ~15
+    placement = {}
+    ring_entry = veneer(ring_disable, 'ring disable')
     if ba - origin < 322:
-        raise ValueError('insufficient aligned common-ROM padding')
+        # Retain the documented CNB window, but don't search arbitrary holes.
+        if ring['ring_on'] == 0x2624D and bank_call == 0x43FB and not any(rom[0x1360:0x14a2]):
+            origin = 0x1360
+        else:
+            # The ring-disable veneer identifies the code bank containing
+            # both nearby ring hooks. Only the modem wrappers stay common.
+            bank = rom[ring_entry + 5]
+            ring_delta = bank << 12
+            start, end = ba + ring_delta, ca + ring_delta
+            if not (ba - origin >= 23 and end <= len(rom)
+                    and start <= ring_disable < ring['ring_on'] < ring['ring_abandon'] < end
+                    and all(0 < addr < ba for addr in (ring['signal_routine'], clock, bank_call))):
+                raise ValueError('insufficient common ROM space or unconfirmed MTR1 ring bank')
+            fill = rom[end-1:end]
+            if fill not in (b'\0', b'\xff'):
+                raise ValueError('MTR1 ring bank has no supported tail padding')
+            ring_phys = (start + len(rom[start:end].rstrip(fill)) + 15) & ~15
+            if ring['ring_abandon'] + 6 > ring_phys or end - ring_phys < 300:
+                raise ValueError('insufficient MTR1 ring-bank tail padding')
+            placement.update(ring_phys=ring_phys, ring_origin=ring_phys-ring_delta,
+                             ring_fill=fill[0], ring_bank=bank)
     # Experimental only: absence of literals does not rule out indirect RAM use.
     scratch = next((a for a in range(ca + 0x300, ca + 0x320, 2)
                     if le(a) not in rom and le(a + 1) not in rom), None)
@@ -272,7 +295,7 @@ def discover(rom):
                 notify=ring['signal_routine'], clock=clock, timer=timer.start(),
                 write=write, writer_bank=delta >> 12, bank_call=bank_call, ring_count=scratch,
                 answer_flag=scratch + 1, guard=guard_addr, seize=veneer(seize.start(), 'seize'),
-                ring_disable=veneer(ring_disable, 'ring disable'),
+                ring_disable=ring_entry,
                 scan=veneer(scan_phys, 'DR enable'), scan_disable=veneer(disable_phys, 'DR disable'),
                 dr_notify=word(dr[2]), start_time=word(start_time[1]), first=ring['ring_on'],
                 later=ring['ring_abandon'], cr0=tuple(m.start() + 4 for m in tx), tx_off=rx[0].start() + 4,
@@ -280,7 +303,7 @@ def discover(rom):
                 ring_block=ring['ring_disable'], clock_word=word(rom[clock+1:clock+3]), guard_timestamp=word(guard[2]),
                 installed_word=next(iter(installed)) if len(installed) == 1 else None,
                 carrier_delay=next(iter(delays)) if len(delays) == 1 else None,
-                dr_config=word(scan_pro[1]) if scan_pro else None)
+                dr_config=word(scan_pro[1]) if scan_pro else None, **placement)
 
 
 def literal(data):
@@ -382,9 +405,17 @@ def discover_mtr2(rom):
     # data task; it need not have a fixed displacement from either state.
     pending = one(rb'\x2a(..)\x7d\xe6\x20\x6f\x26\0\x7d\xb4\x28\x13\x2a\1\x2e\0\x7c\xe6\x07\x67\x7d\xb4\x20\x06\xaf\x32(..)\x18\x05\x3e\x01\x32\2\xc9',
                   rom[timeout.end():timeout.end()+0x900], 'MTR2 CALL_IN pending word')
-    nccs = {(m[1], m[2]) for m in NCC_SETUP.finditer(control)
+    ncc_sites = [m for m in NCC_SETUP.finditer(control)
             if (b'\x3a' + m[1] + b'\xb7' in control and
-                re.search(literal(b'\x3a' + m[2]) + rb'\xe6[\x02\x07]\xb7', control))}
+                re.search(literal(b'\x3a' + m[2]) + rb'\xe6[\x02\x07]\xb7', control))]
+    nccs = {(m[1], m[2]) for m in ncc_sites}
+    if len(nccs) > 1:
+        # Some ROMs repeat these stores in a secondary call state machine.
+        # The NCC dispatcher tries setup, conditionally starts the data task,
+        # and joins the same continuation whether setup succeeded or not.
+        continuation = rb'\xcd..\xb7\xc2(..)\xcd..\xc3\1'
+        nccs = {(m[1], m[2]) for m in ncc_sites
+                if re.match(continuation, control[m.end():m.end()+13], re.S)}
     if len(nccs) != 1:
         raise ValueError('MTR2 NCC setup missing or ambiguous')
     ncc, busy = map(word, next(iter(nccs)))

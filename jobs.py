@@ -63,7 +63,12 @@ def process_one(conn, emulator_url, verifier=verify):
         sources = json.loads(conn.execute('SELECT sources FROM sessions WHERE id=?', (session,)).fetchone()[0])
         chips = [decode_upload(conn.execute('SELECT data FROM blobs WHERE sha=?', (s['sha256'],)).fetchone()[0],
                                s['encoding']) for s in sources]
-        image, manifest = PATCHES[patch].apply(chips)
+        selected = PATCHES.get(patch)
+        if selected is None:
+            raise ValueError('unknown patch selection; submit a new job using GET /patches')
+        if not selected.verification_available:
+            raise ValueError('lab probe is not eligible for queued verification')
+        image, manifest = selected.apply(chips)
         with conn:
             conn.execute("UPDATE jobs SET status='verifying', updated_at=CURRENT_TIMESTAMP WHERE id=?", (job,))
         phase = 'verifying'

@@ -20,7 +20,7 @@ def smoke(url, path, rings):
     session = json.loads(request('/sessions', prefix.encode() + original + f'\r\n--{boundary}--\r\n'.encode(),
                                  'multipart/form-data; boundary=' + boundary))
     job = json.loads(request(f"/sessions/{session['session_id']}/jobs",
-                             json.dumps({'patches': ['call_in'], 'rings': rings}).encode()))
+                              json.dumps({'patches': ['modem_bell212a'], 'rings': rings}).encode()))
     print(path.name, job['status_url'], flush=True)
     deadline = monotonic() + 210
     while monotonic() < deadline:

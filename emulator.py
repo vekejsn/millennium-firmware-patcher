@@ -79,7 +79,8 @@ def verify(image, manifest, rings, url):
         emu.call('snapshots', {'name': 'patcher-boot'})
         for mode in (2, 3, 0, 1):
             try:
-                scenario(emu, p, mode, rings, board)
+                modem = {key: manifest[key] for key in ('answer_cr0', 'data_cr0', 'answer_cr1') if key in manifest}
+                scenario(emu, p, mode, rings, board, **modem)
             except VerificationError as error:
                 raise VerificationError(f'mode {mode}: {error}') from error
     return dict(engine='millennium-go-http', boot=True, board=board, immediate_rings=1,
@@ -87,7 +88,7 @@ def verify(image, manifest, rings, url):
                 provisioning='emulator_ram_only')
 
 
-def scenario(emu, p, mode, rings, board):
+def scenario(emu, p, mode, rings, board, *, answer_cr0=0x1a, data_cr0=None, answer_cr1=None):
     emu.call('snapshots/restore', {'name': 'patcher-boot'})
     state = emu.call('state')
     mmu = state['mmu']
@@ -132,7 +133,7 @@ def scenario(emu, p, mode, rings, board):
         event_id = state['eventId']
         require(not (state['devices']['relays'] & 1) and not any(
             e['type'] == 'relays' and e['value'] & 1 for e in events), 'modem relay seized during no-pickup interval')
-        require(read('data') == read('answer_flag') == 0 and emu.modem_control() != 0x1a,
+        require(read('data') == read('answer_flag') == 0 and emu.modem_control() != answer_cr0,
                 'modem entered answer mode during no-pickup interval')
 
     count = 1 if mode == 2 else rings
@@ -151,11 +152,16 @@ def scenario(emu, p, mode, rings, board):
     require(read('data') == 10 and read('ncc') == 1 and read('busy') & 2
             and read('pending', 2) & 0x20 and read('answer_flag') == 0xa5 and read('ring_enabled') == 0
             and state['devices']['relays'] & 3 == 3 and not state['devices']['dialed']
-            and emu.modem_control() == 0x1a, f'ring {count} did not reach native call-in setup')
+            and emu.modem_control() == answer_cr0, f'ring {count} did not reach native call-in setup')
+    before_carrier = state['eventId']
+    if answer_cr1 is not None:
+        require(emu.call('snapshot')['devices']['modem']['controls'][1] == answer_cr1,
+                'modem did not enter the expected startup pattern')
     emu.line(ring=False, carrier=True, dialTone=False)
     for _ in range(125):
         emu.run(8)
         if read('data') == 12:
-            require(emu.modem_control() == 0x1a, 'answer mode lost after carrier')
-            return
+            require(emu.modem_control() == (answer_cr0 if data_cr0 is None else data_cr0),
+                    'modem did not enter the expected data mode after carrier')
+            return before_carrier
     raise VerificationError('native data task did not accept simulated carrier')

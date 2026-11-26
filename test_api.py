@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 from .api import MAX_BODY, create_app
 from .catalog import MTR2_MMU, MTR2_RESET, Patch, identify
 from .jobs import process_one, send_one, store_build
+from .millennium_callin_standalone import NCC_SETUP, patch_discovered
+from .modem_lab import uart_rates
 
 
 FIRMWARE = Path(__file__).resolve().parents[1] / 'firmware_analysis'
@@ -33,6 +35,76 @@ class ApiTest(unittest.TestCase):
         r = self.client.post('/sessions', files=[('files', item) for item in files])
         self.assertEqual(r.status_code, 201, r.text)
         return r.json()
+
+    def test_demo_roms_are_archived_but_cannot_be_patched(self):
+        directory = 'Millennium Firmwares/'
+        merged = self.rom(directory + 'NLA1X06-demo.bin')
+        chips = [self.rom(directory + f'NLA1X06-demo-f{i}.BIN') for i in (1, 2)]
+        self.assertEqual(b''.join(chips), merged)
+        production = self.rom(directory + 'NLA1X06V1.3.bin')
+        control = self.upload(('demo-in-name-only.bin', production))
+        self.assertFalse(control['firmware']['demo'])
+        self.assertIn('modem_bell212a', [p['id'] for p in control['applicable_patches']])
+        for files in ((merged,), chips):
+            session = self.upload(*[(f'rom{i}.bin', chip) for i, chip in enumerate(files)])
+            self.assertTrue(session['firmware']['demo'])
+            self.assertEqual(session['applicable_patches'], [])
+            url = '/sessions/' + session['session_id']
+            with patch.dict('os.environ', {'FIRMWARE_QUEUE_ENABLED': '1'}):
+                for action, request in (('builds', {'patches': ['modem_bell212a']}),
+                                        ('jobs', {'patches': ['modem_bell212a']}),
+                                        ('builds', {'patches': ['modem_v21'],
+                                                    'modem_targets': ['outbound_ncc']})):
+                    response = self.client.post(url + '/' + action, json=request)
+                    self.assertEqual(response.status_code, 422, response.text)
+                    self.assertIn('demo firmware', response.json()['detail'])
+            for i, chip in enumerate(files):
+                self.assertEqual(self.client.get(f'{url}/originals/{i}').content, chip)
+        with self.assertRaisesRegex(ValueError, 'demo firmware'):
+            patch_discovered(chips)
+
+    def test_mtr1_call_in_can_split_into_confirmed_ring_bank(self):
+        original = self.rom('06CNB03.bin')
+        stock = bytearray(original)
+        # Occupy the documented CNB window so discovery must use a split.
+        self.assertEqual(stock[0x1360], 0)
+        stock[0x1360] = 0x42
+        image, manifest = patch_discovered([bytes(stock)])
+        layout = manifest['layout']
+        delta = layout['ring_bank'] << 12
+        patches = {p['label']: p for p in manifest['patches']}
+        common = patches['fixed_callin_module']
+        ring = patches['banked_ring_module']
+        self.assertEqual(image[0x1360], 0x42)
+        self.assertLessEqual(common['offset'] + len(bytes.fromhex(common['replacement'])), 0x5000)
+        self.assertEqual(ring['offset'] - delta, layout['ring_origin'])
+        for label in ('first_ring', 'later_ring'):
+            hook = patches[label]
+            call = bytes.fromhex(hook['replacement'])
+            self.assertEqual(call[0], 0xcd)
+            self.assertIn(int.from_bytes(call[1:3], 'little') + delta,
+                          range(ring['offset'], ring['offset'] + len(bytes.fromhex(ring['replacement']))))
+        stock[0x4fef] = 0x42  # leave only 16 bytes of common padding
+        with self.assertRaisesRegex(ValueError, 'insufficient common ROM space'):
+            patch_discovered([bytes(stock)])
+
+    def test_mtr2_ncc_setup_uses_dispatcher_to_break_tie(self):
+        stock = self.rom('Millennium Firmwares/NLA1X05V1.3.bin')
+        _, reference = patch_discovered([stock])
+        setup = next(NCC_SETUP.finditer(stock[:0xc0000]))
+        continuation = stock[setup.end():setup.end() + 13]
+        # A second state machine also sets a state byte and the busy flag.
+        # Only the primary dispatcher branches back to the same continuation.
+        decoy = bytes.fromhex('3e013200903a0190f6023201903a0090b73a0190e602b7')
+        at = 0xbfff0 - len(decoy) - len(continuation)
+        synthetic = bytearray(stock)
+        synthetic[at:at + len(decoy)] = decoy
+        _, manifest = patch_discovered([bytes(synthetic)])
+        self.assertEqual(manifest['layout']['ncc'], reference['layout']['ncc'])
+        self.assertEqual(manifest['layout']['busy'], reference['layout']['busy'])
+        synthetic[at:at + len(decoy) + len(continuation)] = decoy[:13] + continuation + decoy[13:]
+        with self.assertRaisesRegex(ValueError, 'NCC setup missing or ambiguous'):
+            patch_discovered([bytes(synthetic)])
 
     def test_applicable_patches_follow_detected_platform_and_rom_checks(self):
         # 12AAV08 puts this signature at 0x56b7, beyond the header window.
@@ -78,6 +150,164 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.headers['access-control-allow-origin'], '*')
         self.assertNotIn('access-control-allow-credentials', response.headers)
 
+    def test_tty_detection_uses_code_not_the_filename_or_edition(self):
+        parser = bytes.fromhex('dde5dd210000dd393af586186eaf32f3863e02dd6e0495c29e11'
+                               '3e0132f586c39e11dd7e043c32f4863e0232f586')
+        mmu = bytes.fromhex('3e85ed393a3e38ed393811')
+        registry = {'modem_bell212a': Patch('Bell 212A', lambda chips: None, ('mtr1',), 'bell212a')}
+        with patch.dict('firmware_patcher.catalog.PATCHES', registry, clear=True):
+            for code, offset in ((b'', None), (parser, len(mmu)),
+                                 (parser[:-2] + b'\0\0', None)):
+                rom = (mmu + code).ljust(0x40000, b'\0')
+                session = self.upload(('TTY.bin', rom))
+                self.assertEqual(session['firmware']['tty_rx_offset'], offset)
+                tty = session['applicable_patches'][0]['modem_targets']['outbound_tty']
+                self.assertFalse(tty['available'])
+                self.assertIn('stock outbound', tty['reason'])
+
+    def test_modem_picker_and_target_validation(self):
+        stock = self.rom('06CNB03.bin')
+        result = self.upload(('stock.bin', stock))
+        url = '/sessions/' + result['session_id']
+        options = {p['modem_mode']: p for p in self.client.get(url + '/patches').json()}
+        self.assertEqual(set(options), {'bell212a', 'bell103'})
+        all_modes = {p['modem_mode']: p for p in self.client.get('/patches').json()}
+        self.assertEqual(all_modes['v21']['platforms'], ['mtr2'])
+        self.assertEqual(all_modes['v22']['platforms'], ['mtr2'])
+        self.assertEqual(all_modes['v22bis']['platforms'], ['mtr2'])
+        bell103 = options['bell103']
+        self.assertFalse(bell103['verification_available'])
+        targets = bell103['modem_targets']
+        self.assertTrue(targets['inbound_ncc']['available'])
+        self.assertTrue(targets['outbound_tty']['available'])
+        self.assertEqual(result['firmware']['tty_rx_kind'], 'cnb_banked')
+        self.assertEqual(result['firmware']['tty_rx_offset'], 0x38146)
+        response = self.client.post(url + '/builds', json={'patches': [bell103['id']], 'modem_targets': ['inbound_ncc', 'outbound_tty']})
+        self.assertEqual(response.status_code, 201, response.text)
+        request = {'patches': [bell103['id']], 'modem_targets': ['inbound_ncc']}
+        for mode in ('v21', 'v22'):
+            for model in (None, '73k222bl'):
+                rejected = self.client.post(url + '/builds', json={
+                    'patches': [f'modem_{mode}'], 'modem_model': model})
+                self.assertEqual(rejected.status_code, 422, rejected.text)
+        with patch.dict('os.environ', {'FIRMWARE_QUEUE_ENABLED': '1'}):
+            response = self.client.post(url + '/jobs', json=request)
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn('lab probe', response.json()['detail'])
+        response = self.client.post(url + '/builds', json=request)
+        self.assertEqual(response.status_code, 201, response.text)
+        build = response.json()
+        self.assertEqual(build['manifest']['modem_targets'], ['inbound_ncc'])
+        self.assertEqual(build['patches'], ['modem_bell103'])
+        for legacy in ({'patches': ['call_in']}, {'patches': ['call_in_bell103_lab']},
+                       {'patches': ['modem_bell103'], 'modem_targets': ['call_in']}):
+            rejected = self.client.post(url + '/builds', json=legacy)
+            self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(build['manifest']['modem_mode'], 'bell103')
+        self.assertFalse(build['manifest']['audio_negotiation_verified'])
+        image = self.client.get(build['download_url']).content
+        self.assertEqual(sha256(image).hexdigest(), build['manifest']['output_sha256'])
+        self.assertEqual(self.client.get(url + '/originals/0').content, stock)
+
+    def test_73k212sl_ip_filters_patch_options_and_builds(self):
+        rom = self.rom('06CNB03.bin')
+        model = '73k212sl-ip'
+        response = self.client.post('/sessions', params={'modem_model': model}, files={'files': ('stock.bin', rom)})
+        self.assertEqual(response.status_code, 201, response.text)
+        session = response.json()
+        url = '/sessions/' + session['session_id']
+        self.assertEqual({p['modem_mode'] for p in session['applicable_patches']}, {'bell212a', 'bell103'})
+        self.assertEqual(self.client.get(url + '/patches', params={'modem_model': model}).json(),
+                         session['applicable_patches'])
+        for patch_id, status in (('modem_bell212a', 201), ('modem_bell103', 201),
+                                 ('modem_v21', 422), ('modem_v22', 422)):
+            response = self.client.post(url + '/builds', json={'patches': [patch_id], 'modem_model': model})
+            self.assertEqual(response.status_code, status, response.text)
+
+    def test_v22bis_rate_without_data_port_dialer(self):
+        for stock, faster in ((0x0b, 0x0a), (0x0c, 0x0b)):
+            report = {'shared_ncc_tty_uart_300_candidate': {'stock_cntlb': hex(stock)},
+                      'dph_uart_signature_matches': []}
+            self.assertEqual(uart_rates(report, 'v22bis'), (stock, faster, 2400))
+            report['dph_uart_signature_matches'].append({'cntlb_1200': hex(stock), 'cntlb_2400': hex(stock)})
+            with self.assertRaisesRegex(ValueError, 'no consistent 2400'):
+                uart_rates(report, 'v22bis')
+
+    def test_v22_family_outbound_options(self):
+        chips = [self.rom(f'Millennium Firmwares/NOA1X01V1.3-f{i}.BIN') for i in (0, 1)]
+        session = self.upload(*[(f'chip{i}.bin', chip) for i, chip in enumerate(chips)])
+        url = '/sessions/' + session['session_id']
+        modes = {p['modem_mode']: p for p in session['applicable_patches']}
+        self.assertNotIn('bell103', modes)
+        for mode, rate in (('v22', 1200), ('v22bis', 2400)):
+            option = modes[mode]
+            self.assertTrue(option['modem_targets']['outbound_ncc']['available'])
+            self.assertTrue(option['modem_targets']['outbound_tty']['available'])
+            for targets in (['outbound_ncc'], ['inbound_ncc', 'outbound_ncc', 'outbound_tty']):
+                response = self.client.post(url + '/builds', json={'patches': [option['id']], 'modem_targets': targets})
+                self.assertEqual(response.status_code, 201, response.text)
+                manifest = response.json()['manifest']
+                self.assertEqual(manifest['uart']['answer_bps'], rate)
+                self.assertFalse(manifest['audio_negotiation_verified'])
+                self.assertTrue(any(p['label'] == 'lab_outbound_mark_hook' for p in manifest['patches']))
+
+    def test_compose_outbound_targets_after_call_in(self):
+        chips = [self.rom(f'Millennium Firmwares/NOA1X01V1.3-f{i}.BIN') for i in (0, 1)]
+        session = self.upload(*[(f'chip{i}.bin', chip) for i, chip in enumerate(chips)])
+        url = '/sessions/' + session['session_id']
+        lab = next(p for p in session['applicable_patches'] if p['id'] == 'modem_v21')
+        self.assertTrue(lab['modem_targets']['outbound_ncc']['available'])
+        self.assertTrue(lab['modem_targets']['outbound_tty']['available'])
+        for targets in (['inbound_ncc'], ['inbound_ncc', 'outbound_ncc'], ['inbound_ncc', 'outbound_tty'],
+                        ['inbound_ncc', 'outbound_tty', 'outbound_ncc']):
+            response = self.client.post(url + '/builds', json={'patches': [lab['id']], 'modem_targets': targets})
+            self.assertEqual(response.status_code, 201, response.text)
+            build = response.json()
+            manifest = build['manifest']
+            self.assertEqual(manifest['modem_targets'], sorted(targets))
+            self.assertEqual('lab_outbound' in manifest, len(targets) > 1)
+            replay = bytearray(b''.join(chips))
+            for p in manifest['patches']:
+                old, new = bytes.fromhex(p['expected']), bytes.fromhex(p['replacement'])
+                i = p['offset']
+                self.assertEqual(replay[i:i+len(old)], old, p['label'])
+                replay[i:i+len(old)] = new
+            self.assertEqual(self.client.get(build['download_url']).content, replay)
+
+    def test_outbound_only_does_not_install_or_replace_call_in(self):
+        stock = self.rom('06CNB03.bin')
+        request = {'patches': ['modem_bell103'], 'modem_targets': ['outbound_ncc']}
+        session = self.upload(('stock.bin', stock))
+        url = '/sessions/' + session['session_id']
+        result = self.client.post(url + '/builds', json=request)
+        self.assertEqual(result.status_code, 201, result.text)
+        outbound = self.client.get(result.json()['download_url']).content
+        self.assertFalse(identify([outbound])['call_in_detected'])
+
+        result = self.client.post(url + '/builds', json={'patches': ['modem_bell212a']})
+        self.assertEqual(result.status_code, 201, result.text)
+        incoming = self.client.get(result.json()['download_url']).content
+        session = self.upload(('already-patched.bin', incoming))
+        self.assertTrue(session['firmware']['call_in_detected'])
+        lab = next(p for p in session['applicable_patches'] if p['id'] == 'modem_bell103')
+        self.assertFalse(lab['modem_targets']['inbound_ncc']['available'])
+        self.assertTrue(lab['modem_targets']['outbound_ncc']['available'])
+        result = self.client.post('/sessions/' + session['session_id'] + '/builds', json=request)
+        self.assertEqual(result.status_code, 201, result.text)
+        self.assertTrue(result.json()['manifest']['preserved_existing_call_in'])
+        self.assertTrue(identify([self.client.get(result.json()['download_url']).content])['call_in_detected'])
+
+    def test_compact_outbound_hooks_fit_06cnb03(self):
+        rom = self.rom('06CNB03.bin')
+        session = self.upload(('stock.bin', rom))
+        response = self.client.post('/sessions/' + session['session_id'] + '/builds', json={
+            'patches': ['modem_bell103'], 'modem_targets': ['inbound_ncc', 'outbound_ncc', 'outbound_tty'],
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        helper = response.json()['manifest']['lab_outbound']
+        self.assertEqual(helper['selector'], 0x4fa0)
+        self.assertLessEqual(helper['selector'] + helper['bytes'], 0x5000)
+
     def test_mtr1_preservation_build_and_restart(self):
         rom = self.rom('06CNB03_UART_recovery.bin')
         result = self.upload(('not-the-firmware-version.bin', rom))
@@ -87,14 +317,14 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT firmware_version, firmware_revision FROM sessions WHERE id = ?',
                                           (result['session_id'],)).fetchone(), ('06CNB03', 'V1.0'))
         self.assertEqual(result['firmware']['terminal_revision'], 'mtr1')
-        self.assertTrue(result['patches']['call_in']['available'])
+        self.assertTrue(result['patches']['modem_bell212a']['available'])
         self.assertEqual(result['session_id'], self.upload(('rename.bin', rom))['session_id'])
         session = '/sessions/' + result['session_id']
-        self.assertEqual(self.client.get('/patches').json()[0]['id'], 'call_in')
-        for patches in ([], ['string_edit'], ['call_in', 'call_in']):
+        self.assertEqual(self.client.get('/patches').json()[0]['id'], 'modem_bell212a')
+        for patches in ([], ['string_edit'], ['modem_bell212a', 'modem_bell212a']):
             r = self.client.post(session + '/builds', json={'patches': patches})
             self.assertEqual(r.status_code, 422, r.text)
-        r = self.client.post(session + '/builds', json={'patches': ['call_in']})
+        r = self.client.post(session + '/builds', json={'patches': ['modem_bell212a']})
         self.assertEqual(r.status_code, 201, r.text)
         build = r.json()
         original_hash = sha256(rom).hexdigest()
@@ -126,10 +356,10 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(split['firmware']['firmware_version'], 'NSA1X03')
         self.assertNotEqual(split['session_id'], merged['session_id'])
         reversed_chips = self.upload(('flash1.bin', b), ('flash0.bin', a))
-        self.assertFalse(reversed_chips['patches']['call_in']['available'])
+        self.assertFalse(reversed_chips['patches']['modem_bell212a']['available'])
         outputs = []
         for record in (split, merged):
-            r = self.client.post('/sessions/' + record['session_id'] + '/builds', json={'patches': ['call_in']})
+            r = self.client.post('/sessions/' + record['session_id'] + '/builds', json={'patches': ['modem_bell212a']})
             self.assertEqual(r.status_code, 201, r.text)
             outputs.append(self.client.get(r.json()['download_url']).content)
         self.assertEqual(*outputs)
@@ -142,10 +372,10 @@ class ApiTest(unittest.TestCase):
         self.assertIsNone(identity['terminal_revision'])
         for name, image in [('unknown.bin', b'mystery bytes'), ('bad.hex', b':invalid')]:
             data = self.upload((name, image))
-            self.assertFalse(data['patches']['call_in']['available'])
+            self.assertFalse(data['patches']['modem_bell212a']['available'])
             url = '/sessions/' + data['session_id']
             self.assertEqual(self.client.get(url + '/originals/0').content, image)
-            self.assertEqual(self.client.post(url + '/builds', json={'patches': ['call_in']}).status_code, 422)
+            self.assertEqual(self.client.post(url + '/builds', json={'patches': ['modem_bell212a']}).status_code, 422)
         self.assertEqual(self.client.get('/sessions/' + 'a'*64).status_code, 404)
         self.assertEqual(self.client.post('/sessions', content=b'x'*(MAX_BODY+1)).status_code, 413)
 
@@ -156,7 +386,7 @@ class ApiTest(unittest.TestCase):
         patched_hash = sha256(patched).hexdigest()
         session = self.upload(('stock.bin', stock))['session_id']
         with closing(sqlite3.connect(self.db)) as conn, conn:
-            store_build(conn, session, ['call_in'], patched, {'output_sha256': patched_hash})
+            store_build(conn, session, ['modem_bell212a'], patched, {'output_sha256': patched_hash})
 
         def catalog_roles():
             groups = self.client.get('/firmwares').json()
@@ -191,7 +421,7 @@ class ApiTest(unittest.TestCase):
         rom = self.rom('06CNB03_UART_recovery.bin')
         session = self.upload(('rom.bin', rom))['session_id']
         with patch.dict('os.environ', {'FIRMWARE_QUEUE_ENABLED': '1', 'FIRMWARE_EMAIL_ENABLED': '1'}):
-            r = self.client.post(f'/sessions/{session}/jobs', json={'patches': ['call_in'], 'notify': True})
+            r = self.client.post(f'/sessions/{session}/jobs', json={'patches': ['modem_bell212a'], 'notify': True})
         self.assertEqual(r.status_code, 202, r.text)
         url = r.headers['Location']
         self.assertEqual(self.client.get(url).json()['status'], 'queued')
@@ -215,7 +445,7 @@ class ApiTest(unittest.TestCase):
         rom = self.rom('06CNB03_UART_recovery.bin')
         session = self.upload(('rom.bin', rom))['session_id']
         with patch.dict('os.environ', {'FIRMWARE_QUEUE_ENABLED': '1'}):
-            job = self.client.post(f'/sessions/{session}/jobs', json={'patches': ['call_in']}).json()
+            job = self.client.post(f'/sessions/{session}/jobs', json={'patches': ['modem_bell212a']}).json()
         with closing(sqlite3.connect(self.db)) as conn:
             def fail(*args):
                 raise ValueError('no boot display')

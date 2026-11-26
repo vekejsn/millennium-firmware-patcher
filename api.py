@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from .catalog import PATCHES, decode_upload, identify
+from .catalog import OUTBOUND_LAB_MODES, PATCHES, ModemModel, ModemTarget, check_modem_model, decode_upload, identify
 from .jobs import SCHEMA, store_build
 from .archive import ERROR_SCHEMA, record_error, save_blob
 
@@ -88,7 +88,8 @@ class BodyLimit:
 class BuildRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     patches: list[Annotated[str, Field(min_length=1, max_length=40)]] = Field(min_length=1, max_length=16)
-
+    modem_targets: list[ModemTarget] | None = Field(default=None, min_length=1, max_length=3)
+    modem_model: ModemModel | None = None
 
 class JobRequest(BuildRequest):
     rings: int = Field(default=3, ge=2, le=10)
@@ -102,7 +103,7 @@ def session_digest(uploads):
     return h.hexdigest()
 
 
-def describe(uploads):
+def describe(uploads, modem_model=None):
     try:
         chips = [decode_upload(data, encoding) for encoding, data in uploads]
     except ValueError as error:
@@ -112,13 +113,31 @@ def describe(uploads):
     capabilities = {}
     applicable = []
     for key, patch in PATCHES.items():
+        if modem_model is not None:
+            try:
+                patch.check_platform(firmware)
+                check_modem_model(firmware['terminal_revision'], patch.modem_mode, modem_model)
+            except ValueError as error:
+                capabilities[key] = dict(available=False, reason=str(error))
+                continue
+        call_in_error = None
         try:
             patch.apply(chips, firmware)
         except ValueError as error:
-            capabilities[key] = dict(available=False, reason=str(error))
-        else:
-            capabilities[key] = dict(available=True, reason=None)
-            applicable.append(patch.metadata(key))
+            call_in_error = str(error)
+        outbound = {}
+        if patch.modem_mode in OUTBOUND_LAB_MODES:
+            for target in (ModemTarget.OUTBOUND_NCC, ModemTarget.OUTBOUND_TTY):
+                try:
+                    patch.apply(chips, firmware, targets=[target])
+                except ValueError as error:
+                    outbound[target] = str(error)
+                else:
+                    outbound[target] = None
+        available = call_in_error is None or any(reason is None for reason in outbound.values())
+        capabilities[key] = dict(available=available, reason=None if available else call_in_error)
+        if available:
+            applicable.append(patch.metadata(key, firmware=firmware, outbound=outbound, call_in_error=call_in_error))
     return dict(firmware=firmware, patches=capabilities, applicable_patches=applicable)
 
 
@@ -220,7 +239,13 @@ def create_app(database=None):
             raise HTTPException(422, 'email notifications are not configured')
         try:
             chips = read_chips(sources)
-            PATCHES[request.patches[0]].check_platform(identify(chips))
+            patch = PATCHES[request.patches[0]]
+            firmware = identify(chips)
+            patch.check_platform(firmware)
+            check_modem_model(firmware['terminal_revision'], patch.modem_mode, request.modem_model)
+            patch.check_targets(request.modem_targets)
+            if not patch.verification_available:
+                raise ValueError('lab probe: use /builds; queue does not verify modem negotiation')
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
         job = token_hex(32)
@@ -312,7 +337,8 @@ def create_app(database=None):
         return [patch.metadata(key) for key, patch in PATCHES.items()]
 
     @app.post('/sessions', status_code=201)
-    def upload(files: Annotated[list[UploadFile], File(description='ROM, or two control chips in flash0/flash1 order')]):
+    def upload(files: Annotated[list[UploadFile], File(description='ROM, or two control chips in flash0/flash1 order')],
+               modem_model: ModemModel | None = None):
         if len(files) not in (1, 2):
             raise HTTPException(422, 'upload one image or two control chips (flash0 then flash1)')
         uploads = []
@@ -332,7 +358,7 @@ def create_app(database=None):
             sources.append(dict(index=index, name=name, encoding=encoding, size=len(data),
                                 sha256=sha256(data).hexdigest()))
         session_id = session_digest(uploads)
-        description = describe(uploads)
+        description = describe(uploads, modem_model)
         with connect() as conn:
             for src, (_, data) in zip(sources, uploads):
                 save_blob(conn, src['sha256'], data)
@@ -343,14 +369,14 @@ def create_app(database=None):
         return session_info(session_id, sources, versions, description)
 
     @app.get('/sessions/{session_id}')
-    def get_session(session_id: ID):
+    def get_session(session_id: ID, modem_model: ModemModel | None = None):
         sources, versions = session_row(session_id)
         return session_info(session_id, sources, versions,
-                            describe([(s['encoding'], get_blob(s['sha256'])) for s in sources]))
+                            describe([(s['encoding'], get_blob(s['sha256'])) for s in sources], modem_model))
 
     @app.get('/sessions/{session_id}/patches')
-    def session_patches(session_id: ID):
-        return get_session(session_id)['applicable_patches']
+    def session_patches(session_id: ID, modem_model: ModemModel | None = None):
+        return get_session(session_id, modem_model)['applicable_patches']
 
     @app.get('/sessions/{session_id}/originals/{index}')
     def download_original(session_id: ID, index: Annotated[int, PathParam(ge=0, le=1)]):
@@ -373,7 +399,14 @@ def create_app(database=None):
         if len(request.patches) != 1:
             raise HTTPException(422, 'these patches cannot be combined')
         try:
-            image, manifest = PATCHES[request.patches[0]].apply(read_chips(sources))
+            patch = PATCHES[request.patches[0]]
+            chips = read_chips(sources)
+            firmware = identify(chips)
+            patch.check_platform(firmware)
+            check_modem_model(firmware['terminal_revision'], patch.modem_mode, request.modem_model)
+            image, manifest = patch.apply(chips, firmware, targets=request.modem_targets)
+            if request.modem_model is not None:
+                manifest['declared_modem_model'] = request.modem_model
         except ValueError as error:
             with connect() as conn:
                 record_error(conn, 'patching', str(error), session_id=session_id)

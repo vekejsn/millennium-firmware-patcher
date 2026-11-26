@@ -36,7 +36,7 @@ printf '%s\n' "$session" | jq '{firmware, applicable_patches}'
 session_id=$(printf '%s\n' "$session" | jq -er '.session_id')
 
 job=$(curl -fsS -H 'Content-Type: application/json' \
-  -d '{"patches":["call_in"],"rings":3}' "$api/sessions/$session_id/jobs")
+  -d '{"patches":["modem_bell212a"],"rings":3}' "$api/sessions/$session_id/jobs")
 status_url=$(printf '%s\n' "$job" | jq -er '.status_url')
 curl -fsS "$api$status_url" | jq .
 ```
@@ -45,9 +45,33 @@ Use `applicable_patches` to populate the patch picker as soon as the upload retu
 
 To refresh the list later, call `GET /sessions/{session_id}/patches`. If it's empty, the `patches` field on the session explains why each patch is unavailable. `GET /patches` lists every registered patch, irrespective of the uploaded ROM.
 
+### Choose a modem mode
+
+Patch IDs describe the mode: `modem_bell212a`, `modem_bell103`, `modem_v21`, `modem_v22`, and `modem_v22bis`. The patcher assumes a 73K212SL-IP on MTR1, so those boards get only Bell 212A and Bell 103. V.21, V.22, and V.22bis are MTR2 lab choices. The session lists only patches that match the ROM's board and patch hooks. V.23 is out of scope.
+
+Use `modem_mode` and `modem_targets` to populate the picker. A request can explicitly select the inbound target:
+
+```json
+{"patches": ["modem_bell103"], "modem_targets": ["inbound_ncc"]}
+```
+
+Send lab requests to `POST /sessions/{session_id}/builds`, not `/jobs`. They have `verification_available: false`: the emulator does not verify audio negotiation, and the V.22bis probe does not implement training.
+
+You can omit `modem_model`. If supplied, use `73k212sl-ip` (or the existing `73k212l` family identifier) for MTR1 and `73k324l` for MTR2. Declaring a different chip does not override the board's allowed modes.
+
+Pass `?modem_model=73k212sl-ip` when uploading or fetching a session or its patch list to show only modes that match that chip and the ROM. This filter is per request; it doesn't change the archived session or replace the modem model in the build request.
+
+For a lab mode, select `outbound_ncc` for terminal-to-Manager calls, or `outbound_tty` for terminal-to-TTY-service calls, when the session marks the target available. Selecting only `outbound_ncc` changes outgoing NCC without adding incoming call handling. Include `inbound_ncc` to add it first. Some ROMs have room for each patch alone but not both together. Omitting `modem_targets` keeps the inbound-only default. Stock outbound Bell 212A needs no patch; `modem_bell212a` adds inbound answering only.
+
+Use the IDs and targets returned by the patch picker. Existing archived builds keep their recorded names.
+
+`firmware.call_in_detected` means the ROM matches the known call-in patch signature. An outbound-only build can preserve that patch if it still uses the stock UART setup. If the uploaded image already modifies that setup, use the original ROM and select the targets together. Unknown third-party inbound code is not detected by this signature. Outbound settings remain experimental: no live modem handshake has been verified, and V.22bis forces QAM without implementing training or fallback.
+
+`firmware.tty_rx_offset` gives the ROM byte offset of a recognized TTY receive routine. The outbound TTY option also requires a matching routing hook and room for the patch. `null` means the signature did not match; it does not prove that the ROM has no TTY code.
+
 Poll `status_url` until the job reaches `succeeded` or `failed`. On success, use `build.download_url` to fetch the ROM and `build.manifest.verification` to read the test results. A failed job returns an error and leaves the original in the archive. An interrupted job goes back into the queue when the worker restarts.
 
-The emulator boots the patched ROM, sets up provisioning in RAM, and checks immediate and delayed answer, carrier, and no pickup in modes 0 and 1. It doesn't test physical hardware or perform a full NCC exchange. If you only want to build a patched ROM, post `{"patches":["call_in"]}` to `/sessions/{session_id}/builds` instead.
+The emulator boots the patched ROM, sets up provisioning in RAM, and checks immediate and delayed answer, carrier, and no pickup in modes 0 and 1. It doesn't test physical hardware or perform a full NCC exchange. If you only want to build a patched ROM, post `{"patches":["modem_bell212a"]}` to `/sessions/{session_id}/builds` instead.
 
 ## Browse the archive
 
