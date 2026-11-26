@@ -169,8 +169,23 @@ class ApiTest(unittest.TestCase):
             return {entry['hash']: entry['provenance'] for entry in group['binaries']}
 
         self.assertEqual(catalog_roles(), {stock_hash: 'source', patched_hash: 'patched'})
+        for digest, provenance, content in ((stock_hash, 'source', stock), (patched_hash, 'patched', patched)):
+            response = self.client.get('/firmwares/' + digest)
+            self.assertEqual(response.content, content)
+            self.assertEqual(response.headers['content-disposition'],
+                             f'attachment; filename="{provenance}-NLA1X05-V1.3.bin"')
         self.upload(('patched.bin', patched))
         self.assertEqual(catalog_roles(), {stock_hash: 'source', patched_hash: 'source_and_patched'})
+        self.assertEqual(self.client.get('/firmwares/' + patched_hash).headers['content-disposition'],
+                         'attachment; filename="source_and_patched-NLA1X05-V1.3.bin"')
+
+    def test_download_by_hash_names_unidentified_firmware(self):
+        data = b'unidentified dump'
+        self.upload(('unnamed.bin', data))
+        response = self.client.get('/firmwares/' + sha256(data).hexdigest())
+        self.assertEqual(response.content, data)
+        self.assertEqual(response.headers['content-disposition'],
+                         'attachment; filename="source-unknown-unknown.bin"')
 
     def test_queued_build_and_notification(self):
         rom = self.rom('06CNB03_UART_recovery.bin')

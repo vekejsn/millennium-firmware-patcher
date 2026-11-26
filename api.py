@@ -32,6 +32,12 @@ class FirmwareProvenance(StrEnum):
     PATCHED = 'patched'
     SOURCE_AND_PATCHED = 'source_and_patched'
 
+    @classmethod
+    def from_roles(cls, source, patched):
+        if source and patched:
+            return cls.SOURCE_AND_PATCHED
+        return cls.PATCHED if patched else cls.SOURCE
+
 
 class CatalogBinary(BaseModel):
     hash: str
@@ -261,10 +267,9 @@ def create_app(database=None):
     def read_chips(sources):
         return [decode_upload(get_blob(s['sha256']), s['encoding']) for s in sources]
 
-    @app.get('/firmwares', response_model=list[CatalogGroup])
-    def list_firmwares():
+    def catalog_rows(digest=None):
         with connect() as conn:
-            rows = conn.execute('''
+            return conn.execute('''
                 WITH catalog(version, revision, sha, is_source, is_patched) AS (
                   SELECT s.firmware_version, s.firmware_revision, json_extract(source.value, '$.sha256'), 1, 0
                     FROM sessions s, json_each(s.sources) AS source
@@ -274,24 +279,28 @@ def create_app(database=None):
                 )
                 SELECT version, revision, catalog.sha, blobs.updated_at, MAX(is_source), MAX(is_patched)
                   FROM catalog JOIN blobs ON blobs.sha = catalog.sha
+                 WHERE (? IS NULL OR catalog.sha = ?)
                  GROUP BY version, revision, catalog.sha, blobs.updated_at
                  ORDER BY version IS NULL, version, revision, blobs.updated_at DESC, catalog.sha
-            ''').fetchall()
+            ''', (digest, digest)).fetchall()
+
+    @app.get('/firmwares', response_model=list[CatalogGroup])
+    def list_firmwares():
         groups = {}
-        for version, revision, digest, updated_at, source, patched in rows:
+        for version, revision, digest, updated_at, source, patched in catalog_rows():
             group = groups.setdefault((version, revision), dict(version=version, revision=revision, binaries=[]))
-            if source and patched:
-                provenance = FirmwareProvenance.SOURCE_AND_PATCHED
-            elif patched:
-                provenance = FirmwareProvenance.PATCHED
-            else:
-                provenance = FirmwareProvenance.SOURCE
+            provenance = FirmwareProvenance.from_roles(source, patched)
             group['binaries'].append(dict(hash=digest, updated_at=updated_at, provenance=provenance))
         return list(groups.values())
 
     @app.get('/firmwares/{digest}')
     def download_by_hash(digest: ID):
-        return binary(get_blob(digest), digest)
+        rows = catalog_rows(digest)
+        if not rows:
+            raise HTTPException(404, 'firmware hash not found')
+        version, revision, _, _, source, patched = rows[0]
+        provenance = FirmwareProvenance.from_roles(source, patched)
+        return binary(get_blob(digest), f'{provenance}-{version or "unknown"}-{revision or "unknown"}.bin')
 
     def session_info(session_id, sources, versions, description):
         if description['firmware'] is not None:
