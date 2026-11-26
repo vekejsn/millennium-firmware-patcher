@@ -32,7 +32,7 @@ Using `curl` and `jq`:
 ```sh
 api=http://127.0.0.1:8001
 session=$(curl -fsS -F 'files=@/path/to/control-rom.bin' "$api/sessions")
-printf '%s\n' "$session" | jq '{firmware, patches}'
+printf '%s\n' "$session" | jq '{firmware, applicable_patches}'
 session_id=$(printf '%s\n' "$session" | jq -er '.session_id')
 
 job=$(curl -fsS -H 'Content-Type: application/json' \
@@ -40,6 +40,10 @@ job=$(curl -fsS -H 'Content-Type: application/json' \
 status_url=$(printf '%s\n' "$job" | jq -er '.status_url')
 curl -fsS "$api$status_url" | jq .
 ```
+
+Use `applicable_patches` to populate the patch picker as soon as the upload returns. The API checks the detected board and the ROM's patch signatures before adding a patch to that list. Each entry provides an `id`, `label`, and `platforms` (`mtr1`, `mtr2`, or both). Use the `id` when submitting a build or job.
+
+To refresh the list later, call `GET /sessions/{session_id}/patches`. If it's empty, the `patches` field on the session explains why each patch is unavailable. `GET /patches` lists every registered patch, irrespective of the uploaded ROM.
 
 Poll `status_url` until the job reaches `succeeded` or `failed`. On success, use `build.download_url` to fetch the ROM and `build.manifest.verification` to read the test results. A failed job returns an error and leaves the original in the archive. An interrupted job goes back into the queue when the worker restarts.
 

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from .api import MAX_BODY, create_app
-from .catalog import identify
+from .catalog import MTR2_MMU, MTR2_RESET, Patch, identify
 from .jobs import process_one, send_one, store_build
 
 
@@ -33,6 +33,35 @@ class ApiTest(unittest.TestCase):
         r = self.client.post('/sessions', files=[('files', item) for item in files])
         self.assertEqual(r.status_code, 201, r.text)
         return r.json()
+
+    def test_applicable_patches_follow_detected_platform_and_rom_checks(self):
+        mtr1 = bytes.fromhex('3e85ed393a3e38ed393811').ljust(0x40000, b'\0')
+        mtr2 = (MTR2_MMU.ljust(0xc0000, b'\0') + MTR2_RESET).ljust(0x100000, b'\0')
+
+        def reject(_chips):
+            raise ValueError('required hook is missing')
+
+        registry = {
+            'mtr1_only': Patch('MTR1 only', lambda chips: None, ('mtr1',)),
+            'mtr2_only': Patch('MTR2 only', lambda chips: None, ('mtr2',)),
+            'both': Patch('Both', lambda chips: None, ('mtr1', 'mtr2')),
+            'missing_hook': Patch('Missing hook', reject, ('mtr1', 'mtr2')),
+        }
+        with patch.dict('firmware_patcher.catalog.PATCHES', registry, clear=True), \
+                patch.dict('os.environ', {'FIRMWARE_QUEUE_ENABLED': '1'}):
+            self.assertEqual(self.client.get('/patches').json(), [p.metadata(k) for k, p in registry.items()])
+            for rom, board, wrong in ((mtr1, 'mtr1', 'mtr2_only'), (mtr2, 'mtr2', 'mtr1_only')):
+                data = self.upload(('renamed.bin', rom))
+                url = '/sessions/' + data['session_id']
+                self.assertEqual(data['firmware']['terminal_revision'], board)
+                self.assertEqual([p['id'] for p in data['applicable_patches']], [board + '_only', 'both'])
+                self.assertEqual(self.client.get(url + '/patches').json(), data['applicable_patches'])
+                self.assertEqual(data['patches']['missing_hook']['reason'], 'required hook is missing')
+                for action in ('builds', 'jobs'):
+                    result = self.client.post(url + '/' + action, json={'patches': [wrong]})
+                    self.assertEqual(result.status_code, 422, result.text)
+                    self.assertIn(f'not {board.upper()}', result.json()['detail'])
+            self.assertEqual(self.upload(('unknown.bin', b'unknown'))['applicable_patches'], [])
 
     def test_cors_allows_cross_origin_requests_without_credentials(self):
         origin = 'https://frontend.example'

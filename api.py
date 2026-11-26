@@ -100,16 +100,20 @@ def describe(uploads):
     try:
         chips = [decode_upload(data, encoding) for encoding, data in uploads]
     except ValueError as error:
-        return dict(firmware=None, patches={key: {'available': False, 'reason': str(error)} for key in PATCHES})
+        return dict(firmware=None, applicable_patches=[], patches={
+            key: {'available': False, 'reason': str(error)} for key in PATCHES})
+    firmware = identify(chips)
     capabilities = {}
+    applicable = []
     for key, patch in PATCHES.items():
         try:
-            patch.build(chips)
+            patch.apply(chips, firmware)
         except ValueError as error:
             capabilities[key] = dict(available=False, reason=str(error))
         else:
             capabilities[key] = dict(available=True, reason=None)
-    return dict(firmware=identify(chips), patches=capabilities)
+            applicable.append(patch.metadata(key))
+    return dict(firmware=firmware, patches=capabilities, applicable_patches=applicable)
 
 
 def version_fields(firmware):
@@ -201,13 +205,18 @@ def create_app(database=None):
 
     @app.post('/sessions/{session_id}/jobs', status_code=202)
     def enqueue(session_id: ID, request: JobRequest):
-        source_rows(session_id)
+        sources = source_rows(session_id)
         if len(request.patches) != 1 or request.patches[0] not in PATCHES:
             raise HTTPException(422, 'select exactly one registered patch')
         if os.environ.get('FIRMWARE_QUEUE_ENABLED') != '1':
             raise HTTPException(503, 'verification worker not configured')
         if request.notify and os.environ.get('FIRMWARE_EMAIL_ENABLED') != '1':
             raise HTTPException(422, 'email notifications are not configured')
+        try:
+            chips = read_chips(sources)
+            PATCHES[request.patches[0]].check_platform(identify(chips))
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
         job = token_hex(32)
         with connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -249,6 +258,9 @@ def create_app(database=None):
             raise HTTPException(404, 'firmware hash not found')
         return row[0]
 
+    def read_chips(sources):
+        return [decode_upload(get_blob(s['sha256']), s['encoding']) for s in sources]
+
     @app.get('/firmwares', response_model=list[CatalogGroup])
     def list_firmwares():
         with connect() as conn:
@@ -288,7 +300,7 @@ def create_app(database=None):
 
     @app.get('/patches')
     def list_patches():
-        return [{'id': key, 'label': patch.label, 'experimental': True} for key, patch in PATCHES.items()]
+        return [patch.metadata(key) for key, patch in PATCHES.items()]
 
     @app.post('/sessions', status_code=201)
     def upload(files: Annotated[list[UploadFile], File(description='ROM, or two control chips in flash0/flash1 order')]):
@@ -327,6 +339,10 @@ def create_app(database=None):
         return session_info(session_id, sources, versions,
                             describe([(s['encoding'], get_blob(s['sha256'])) for s in sources]))
 
+    @app.get('/sessions/{session_id}/patches')
+    def session_patches(session_id: ID):
+        return get_session(session_id)['applicable_patches']
+
     @app.get('/sessions/{session_id}/originals/{index}')
     def download_original(session_id: ID, index: Annotated[int, PathParam(ge=0, le=1)]):
         sources = source_rows(session_id)
@@ -348,8 +364,7 @@ def create_app(database=None):
         if len(request.patches) != 1:
             raise HTTPException(422, 'these patches cannot be combined')
         try:
-            chips = [decode_upload(get_blob(s['sha256']), s['encoding']) for s in sources]
-            image, manifest = PATCHES[request.patches[0]].build(chips)
+            image, manifest = PATCHES[request.patches[0]].apply(read_chips(sources))
         except ValueError as error:
             with connect() as conn:
                 record_error(conn, 'patching', str(error), session_id=session_id)

@@ -63,7 +63,7 @@ def process_one(conn, emulator_url, verifier=verify):
         sources = json.loads(conn.execute('SELECT sources FROM sessions WHERE id=?', (session,)).fetchone()[0])
         chips = [decode_upload(conn.execute('SELECT data FROM blobs WHERE sha=?', (s['sha256'],)).fetchone()[0],
                                s['encoding']) for s in sources]
-        image, manifest = PATCHES[patch].build(chips)
+        image, manifest = PATCHES[patch].apply(chips)
         with conn:
             conn.execute("UPDATE jobs SET status='verifying', updated_at=CURRENT_TIMESTAMP WHERE id=?", (job,))
         phase = 'verifying'

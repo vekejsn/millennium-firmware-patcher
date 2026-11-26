@@ -50,6 +50,22 @@ def decode_upload(data, encoding):
 class Patch:
     label: str
     build: Callable
+    platforms: tuple[str, ...]
+
+    def metadata(self, key):
+        return dict(id=key, label=self.label, platforms=list(self.platforms), experimental=True)
+
+    def check_platform(self, firmware):
+        platform = firmware['terminal_revision']
+        if platform is None:
+            raise ValueError('could not identify the ROM platform as MTR1 or MTR2')
+        if platform not in self.platforms:
+            supported = ', '.join(self.platforms).upper()
+            raise ValueError(f'{self.label} supports {supported}, not {platform.upper()}')
+
+    def apply(self, chips, firmware=None):
+        self.check_platform(identify(chips) if firmware is None else firmware)
+        return self.build(chips)
 
 
-PATCHES = {'call_in': Patch('Inbound modem call-in', patch_discovered)}
+PATCHES = {'call_in': Patch('Inbound modem call-in', patch_discovered, ('mtr1', 'mtr2'))}
