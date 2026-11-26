@@ -1,0 +1,15 @@
+services:
+  api:
+    volumes:
+      - type: bind
+        source: ${FIRMWARE_DATA_DIR:?Set FIRMWARE_DATA_DIR to an existing writable host directory}
+        target: /data
+        bind:
+          create_host_path: false
+  worker:
+    volumes:
+      - type: bind
+        source: ${FIRMWARE_DATA_DIR:?Set FIRMWARE_DATA_DIR to an existing writable host directory}
+        target: /data
+        bind:
+          create_host_path: false

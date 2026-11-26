@@ -1,0 +1,60 @@
+name: millennium-patcher
+services:
+  api:
+    image: millennium-patcher:local
+    build:
+      context: .
+      target: patcher
+    environment:
+      FIRMWARE_QUEUE_ENABLED: '1'
+      FIRMWARE_EMAIL_ENABLED: ${FIRMWARE_EMAIL_ENABLED:-0}
+    ports:
+      - '127.0.0.1:${PATCHER_PORT:-8001}:8001'
+    volumes:
+      - archive:/data
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 8
+    restart: unless-stopped
+  emulator:
+    build:
+      context: .
+      target: emulator
+      args:
+        EMULATOR_REF: ${EMULATOR_REF:-main}
+    volumes:
+      - candidates:/verify:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+  worker:
+    image: millennium-patcher:local
+    pull_policy: never
+    command: [python, -m, firmware_patcher.jobs]
+    network_mode: service:emulator
+    depends_on:
+      api:
+        condition: service_healthy
+      emulator:
+        condition: service_started
+        restart: true
+    volumes:
+      - archive:/data
+      - candidates:/verify
+    environment:
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://127.0.0.1:8001}
+    restart: unless-stopped
+
+volumes:
+  archive:
+  candidates:
