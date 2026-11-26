@@ -35,7 +35,8 @@ class ApiTest(unittest.TestCase):
         return r.json()
 
     def test_applicable_patches_follow_detected_platform_and_rom_checks(self):
-        mtr1 = bytes.fromhex('3e85ed393a3e38ed393811').ljust(0x40000, b'\0')
+        # 12AAV08 puts this signature at 0x56b7, beyond the header window.
+        mtr1 = (bytes(0x56b7) + bytes.fromhex('3e96ed393a3e37ed393811')).ljust(0x40000, b'\0')
         mtr2 = (MTR2_MMU.ljust(0xc0000, b'\0') + MTR2_RESET).ljust(0x100000, b'\0')
 
         def reject(_chips):

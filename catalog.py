@@ -28,8 +28,9 @@ def identify(chips):
         edition, revision = (match[k].decode('ascii') for k in ('edition', 'revision'))
         code = match['code'].decode('ascii') if match['code'] else None
     board = None
+    # MTR1 startup code can sit above the header scan window (12AAV08).
     if len(rom) == 0x40000 and any(
-        ((m[1][0] >> 4) + m[2][0]) << 12 == 0x40000 for m in MTR1_MMU.finditer(common)
+        ((m[1][0] >> 4) + m[2][0]) << 12 == 0x40000 for m in MTR1_MMU.finditer(rom)
     ):
         board = 'mtr1'
     elif len(rom) == 0x100000 and MTR2_MMU in common and rom[0xc0000:0xc0008] == MTR2_RESET:
