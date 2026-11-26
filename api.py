@@ -12,6 +12,7 @@ from typing import Annotated
 from secrets import token_hex
 
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -175,6 +176,13 @@ def create_app(database=None):
 
     app = FastAPI(title='Millennium Firmware Patcher', version='0.1.0', lifespan=lifespan)
     app.add_middleware(BodyLimit)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=['*'],
+        allow_methods=['*'],
+        allow_headers=['*'],
+        expose_headers=['Content-Disposition', 'Location', 'Retry-After'],
+    )
 
     @app.exception_handler(Exception)
     def unexpected_error(request: Request, error: Exception):

@@ -34,6 +34,20 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(r.status_code, 201, r.text)
         return r.json()
 
+    def test_cors_allows_cross_origin_requests_without_credentials(self):
+        origin = 'https://frontend.example'
+        preflight = self.client.options('/sessions', headers={
+            'Origin': origin,
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Headers': 'Content-Type',
+        })
+        self.assertEqual(preflight.status_code, 200)
+        self.assertEqual(preflight.headers['access-control-allow-origin'], '*')
+        self.assertIn('POST', preflight.headers['access-control-allow-methods'])
+        response = self.client.get('/firmwares', headers={'Origin': origin})
+        self.assertEqual(response.headers['access-control-allow-origin'], '*')
+        self.assertNotIn('access-control-allow-credentials', response.headers)
+
     def test_mtr1_preservation_build_and_restart(self):
         rom = self.rom('06CNB03_UART_recovery.bin')
         result = self.upload(('not-the-firmware-version.bin', rom))
