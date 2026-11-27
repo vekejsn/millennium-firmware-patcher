@@ -83,6 +83,8 @@ The emulator boots the patched ROM, sets up provisioning in RAM, and checks imme
 | `patched` | The service produced these bytes as a patch output. |
 | `source_and_patched` | The same bytes came from both an upload and a build in this group. |
 
+For `patched` and `source_and_patched`, `applied_patches` lists the distinct patch IDs recorded by builds that produced that hash in the group, for example `["modem_bell212a"]`. The list keeps historical IDs as recorded and doesn't infer patches from uploaded bytes. Entries with `source` provenance omit this field.
+
 Provenance doesn't tell you whether a build passed emulator checks; check its verification report for that. Split uploads list the chip files separately. `updated_at` is when the service last saved those bytes, in UTC. Older entries may have no recorded time (`null`), and unidentified uploads have `null` for the version and revision.
 
 ```sh

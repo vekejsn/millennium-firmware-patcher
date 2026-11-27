@@ -387,6 +387,9 @@ class ApiTest(unittest.TestCase):
         session = self.upload(('stock.bin', stock))['session_id']
         with closing(sqlite3.connect(self.db)) as conn, conn:
             store_build(conn, session, ['modem_bell212a'], patched, {'output_sha256': patched_hash})
+            store_build(conn, session, ['call_in'], patched, {'output_sha256': patched_hash})
+            store_build(conn, session, ['modem_bell212a'], patched,
+                        {'output_sha256': patched_hash, 'verification': {'boot': True}})
 
         def catalog_roles():
             groups = self.client.get('/firmwares').json()
@@ -394,9 +397,10 @@ class ApiTest(unittest.TestCase):
             group = groups[0]
             self.assertEqual((group['version'], group['revision']), ('NLA1X05', 'V1.3'))
             self.assertEqual(len(group['binaries']), 2)
-            for entry in group['binaries']:
-                self.assertEqual(set(entry), {'hash', 'updated_at', 'provenance'})
-            return {entry['hash']: entry['provenance'] for entry in group['binaries']}
+            entries = {entry['hash']: entry for entry in group['binaries']}
+            self.assertEqual(set(entries[stock_hash]), {'hash', 'updated_at', 'provenance'})
+            self.assertEqual(entries[patched_hash]['applied_patches'], ['call_in', 'modem_bell212a'])
+            return {digest: entry['provenance'] for digest, entry in entries.items()}
 
         self.assertEqual(catalog_roles(), {stock_hash: 'source', patched_hash: 'patched'})
         for digest, provenance, content in ((stock_hash, 'source', stock), (patched_hash, 'patched', patched)):

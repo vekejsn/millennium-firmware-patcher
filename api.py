@@ -43,6 +43,7 @@ class CatalogBinary(BaseModel):
     hash: str
     updated_at: str | None
     provenance: FirmwareProvenance
+    applied_patches: list[str] = Field(default_factory=list)
 
 
 class CatalogGroup(BaseModel):
@@ -295,27 +296,32 @@ def create_app(database=None):
     def catalog_rows(digest=None):
         with connect() as conn:
             return conn.execute('''
-                WITH catalog(version, revision, sha, is_source, is_patched) AS (
-                  SELECT s.firmware_version, s.firmware_revision, json_extract(source.value, '$.sha256'), 1, 0
+                WITH catalog(version, revision, sha, is_source, is_patched, patch_ids) AS (
+                  SELECT s.firmware_version, s.firmware_revision, json_extract(source.value, '$.sha256'), 1, 0, NULL
                     FROM sessions s, json_each(s.sources) AS source
                   UNION ALL
-                  SELECT s.firmware_version, s.firmware_revision, b.sha, 0, 1
+                  SELECT s.firmware_version, s.firmware_revision, b.sha, 0, 1, json_extract(b.info, '$.patches')
                     FROM builds b JOIN sessions s ON s.id = b.session
                 )
-                SELECT version, revision, catalog.sha, blobs.updated_at, MAX(is_source), MAX(is_patched)
+                SELECT version, revision, catalog.sha, blobs.updated_at, MAX(is_source), MAX(is_patched),
+                       json_group_array(DISTINCT patch.value) FILTER (WHERE patch.type = 'text')
                   FROM catalog JOIN blobs ON blobs.sha = catalog.sha
+                  LEFT JOIN json_each(catalog.patch_ids) AS patch ON TRUE
                  WHERE (? IS NULL OR catalog.sha = ?)
                  GROUP BY version, revision, catalog.sha, blobs.updated_at
                  ORDER BY version IS NULL, version, revision, blobs.updated_at DESC, catalog.sha
             ''', (digest, digest)).fetchall()
 
-    @app.get('/firmwares', response_model=list[CatalogGroup])
+    @app.get('/firmwares', response_model=list[CatalogGroup], response_model_exclude_unset=True)
     def list_firmwares():
         groups = {}
-        for version, revision, digest, updated_at, source, patched in catalog_rows():
+        for version, revision, digest, updated_at, source, patched, patch_ids in catalog_rows():
             group = groups.setdefault((version, revision), dict(version=version, revision=revision, binaries=[]))
             provenance = FirmwareProvenance.from_roles(source, patched)
-            group['binaries'].append(dict(hash=digest, updated_at=updated_at, provenance=provenance))
+            entry = dict(hash=digest, updated_at=updated_at, provenance=provenance)
+            if patched:
+                entry['applied_patches'] = sorted(json.loads(patch_ids))
+            group['binaries'].append(entry)
         return list(groups.values())
 
     @app.get('/firmwares/{digest}')
@@ -323,7 +329,7 @@ def create_app(database=None):
         rows = catalog_rows(digest)
         if not rows:
             raise HTTPException(404, 'firmware hash not found')
-        version, revision, _, _, source, patched = rows[0]
+        version, revision, _, _, source, patched, _ = rows[0]
         provenance = FirmwareProvenance.from_roles(source, patched)
         return binary(get_blob(digest), f'{provenance}-{version or "unknown"}-{revision or "unknown"}.bin')
 
