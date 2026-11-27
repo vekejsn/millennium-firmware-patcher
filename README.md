@@ -55,7 +55,7 @@ Use `modem_mode` and `modem_targets` to populate the picker. A request can expli
 {"patches": ["modem_bell103"], "modem_targets": ["inbound_ncc"]}
 ```
 
-Send lab requests to `POST /sessions/{session_id}/builds`, not `/jobs`. They have `verification_available: false`: the emulator does not verify audio negotiation, and the V.22bis probe does not implement training.
+Send requests that include `inbound_ncc` to `POST /sessions/{session_id}/jobs` for emulator checks, including Bell 103 and the V-series modes. `verification_available` indicates that the inbound option can be queued. Use `/builds` for outbound-only builds or to skip verification.
 
 You can omit `modem_model`. If supplied, use `73k212sl-ip` (or the existing `73k212l` family identifier) for MTR1 and `73k324l` for MTR2. Declaring a different chip does not override the board's allowed modes.
 
@@ -71,7 +71,7 @@ Use the IDs and targets returned by the patch picker. Existing archived builds k
 
 Poll `status_url` until the job reaches `succeeded` or `failed`. On success, use `build.download_url` to fetch the ROM and `build.manifest.verification` to read the test results. A failed job returns an error and leaves the original in the archive. An interrupted job goes back into the queue when the worker restarts.
 
-The emulator boots the patched ROM, sets up provisioning in RAM, and checks immediate and delayed answer, carrier, and no pickup in modes 0 and 1. It doesn't test physical hardware or perform a full NCC exchange. If you only want to build a patched ROM, post `{"patches":["modem_bell212a"]}` to `/sessions/{session_id}/builds` instead.
+The emulator boots the patched ROM and checks immediate and delayed answer, simulated carrier, and no pickup in modes 0 and 1. Lab modes also check UART selection and an inbound NCC serial exchange with a CRC-checked peer CLEAR. A job with outgoing paths selected builds those paths into the same ROM but does not test complete outgoing calls. No job verifies real audio negotiation or physical hardware. The V.22bis probe still does not implement training or fallback.
 
 ## Browse the archive
 

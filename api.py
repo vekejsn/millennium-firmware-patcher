@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from .catalog import OUTBOUND_LAB_MODES, PATCHES, ModemModel, ModemTarget, check_modem_model, decode_upload, identify
-from .jobs import SCHEMA, store_build
+from .jobs import init_jobs, store_build
 from .archive import ERROR_SCHEMA, record_error, save_blob
 
 
@@ -201,7 +201,8 @@ def create_app(database=None):
             if 'updated_at' not in {row[1] for row in conn.execute('PRAGMA table_info(blobs)')}:
                 conn.execute('ALTER TABLE blobs ADD COLUMN updated_at TEXT')
         with connect() as conn:
-            conn.executescript(SCHEMA + ERROR_SCHEMA)
+            init_jobs(conn)
+            conn.executescript(ERROR_SCHEMA)
         yield
 
     app = FastAPI(title='Millennium Firmware Patcher', version='0.1.0', lifespan=lifespan)
@@ -232,6 +233,7 @@ def create_app(database=None):
     @app.post('/sessions/{session_id}/jobs', status_code=202)
     def enqueue(session_id: ID, request: JobRequest):
         sources = source_rows(session_id)
+        targets = request.modem_targets or [ModemTarget.INBOUND_NCC]
         if len(request.patches) != 1 or request.patches[0] not in PATCHES:
             raise HTTPException(422, 'select exactly one registered patch')
         if os.environ.get('FIRMWARE_QUEUE_ENABLED') != '1':
@@ -244,9 +246,7 @@ def create_app(database=None):
             firmware = identify(chips)
             patch.check_platform(firmware)
             check_modem_model(firmware['terminal_revision'], patch.modem_mode, request.modem_model)
-            patch.check_targets(request.modem_targets)
-            if not patch.verification_available:
-                raise ValueError('lab probe: use /builds; queue does not verify modem negotiation')
+            patch.check_verification_targets(targets)
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
         job = token_hex(32)
@@ -254,8 +254,9 @@ def create_app(database=None):
             conn.execute('BEGIN IMMEDIATE')
             if conn.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','patching','verifying')").fetchone()[0] >= 32:
                 raise HTTPException(429, 'verification queue is full')
-            conn.execute('INSERT INTO jobs (id,session,patch,rings,notification) VALUES (?,?,?,?,?)',
-                         (job, session_id, request.patches[0], request.rings, 'pending' if request.notify else 'not_requested'))
+            conn.execute('INSERT INTO jobs (id,session,patch,rings,notification,modem_targets) VALUES (?,?,?,?,?,?)',
+                         (job, session_id, request.patches[0], request.rings,
+                          'pending' if request.notify else 'not_requested', json.dumps(targets)))
         return JSONResponse(dict(job_id=job, status='queued', status_url=f'/jobs/{job}'),
                             status_code=202, headers={'Location': f'/jobs/{job}', 'Retry-After': '1'})
 
@@ -264,10 +265,11 @@ def create_app(database=None):
         with connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute('''SELECT id AS job_id,session AS session_id,patch,rings,status,created_at,updated_at,
-                                  build_id,error,notification FROM jobs WHERE id=?''', (job_id,)).fetchone()
+                                  build_id,error,notification,modem_targets FROM jobs WHERE id=?''', (job_id,)).fetchone()
         if row is None:
             raise HTTPException(404, 'job not found')
         result = dict(row)
+        result['modem_targets'] = json.loads(result['modem_targets'])
         if result['build_id']:
             result['build'] = get_build(result['session_id'], result['build_id'])
         return result

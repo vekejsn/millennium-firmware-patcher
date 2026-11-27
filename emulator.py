@@ -85,7 +85,8 @@ def verify(image, manifest, rings, url):
                 raise VerificationError(f'mode {mode}: {error}') from error
     return dict(engine='millennium-go-http', boot=True, board=board, immediate_rings=1,
                 delayed_rings=rings, carrier_accepted_in_both=True, no_pickup_modes=[0, 1],
-                provisioning='emulator_ram_only')
+                provisioning='emulator_ram_only', carrier_source='emulator_injected',
+                audio_negotiation_tested=False)
 
 
 def scenario(emu, p, mode, rings, board, *, answer_cr0=0x1a, data_cr0=None, answer_cr1=None):

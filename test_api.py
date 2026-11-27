@@ -176,7 +176,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(all_modes['v22']['platforms'], ['mtr2'])
         self.assertEqual(all_modes['v22bis']['platforms'], ['mtr2'])
         bell103 = options['bell103']
-        self.assertFalse(bell103['verification_available'])
+        self.assertTrue(bell103['verification_available'])
         targets = bell103['modem_targets']
         self.assertTrue(targets['inbound_ncc']['available'])
         self.assertTrue(targets['outbound_tty']['available'])
@@ -191,9 +191,9 @@ class ApiTest(unittest.TestCase):
                     'patches': [f'modem_{mode}'], 'modem_model': model})
                 self.assertEqual(rejected.status_code, 422, rejected.text)
         with patch.dict('os.environ', {'FIRMWARE_QUEUE_ENABLED': '1'}):
-            response = self.client.post(url + '/jobs', json=request)
+            response = self.client.post(url + '/jobs', json=dict(request, modem_targets=['outbound_ncc']))
             self.assertEqual(response.status_code, 422, response.text)
-            self.assertIn('lab probe', response.json()['detail'])
+            self.assertIn('requires inbound_ncc', response.json()['detail'])
         response = self.client.post(url + '/builds', json=request)
         self.assertEqual(response.status_code, 201, response.text)
         build = response.json()
@@ -444,6 +444,33 @@ class ApiTest(unittest.TestCase):
         status = self.client.get(url).json()
         self.assertEqual((status['status'], status['notification']), ('succeeded', 'sent'))
         self.assertTrue(status['build']['manifest']['verification']['boot'])
+
+    def test_queued_bell103_runs_lab_verifier_on_selected_targets(self):
+        rom = self.rom('06CNB03.bin')
+        session = self.upload(('rom.bin', rom))['session_id']
+        targets = ['inbound_ncc', 'outbound_ncc', 'outbound_tty']
+        with patch.dict('os.environ', {'FIRMWARE_QUEUE_ENABLED': '1'}):
+            response = self.client.post(f'/sessions/{session}/jobs', json={
+                'patches': ['modem_bell103'], 'modem_targets': targets, 'rings': 4,
+            })
+        self.assertEqual(response.status_code, 202, response.text)
+        url = response.json()['status_url']
+        self.assertEqual(self.client.get(url).json()['modem_targets'], targets)
+
+        def check(image, manifest, rings, emulator_url):
+            self.assertEqual(manifest['modem_targets'], targets)
+            self.assertEqual(manifest['uart']['answer_bps'], 300)
+            self.assertEqual(sha256(image).hexdigest(), manifest['output_sha256'])
+            self.assertEqual((rings, emulator_url), (4, 'unused'))
+            self.assertEqual(self.client.get(url).json()['status'], 'verifying')
+            return {'boot': True, 'audio_negotiation_tested': False}
+
+        with closing(sqlite3.connect(self.db)) as conn, patch('firmware_patcher.jobs.verify_candidate', side_effect=check) as lab:
+            self.assertTrue(process_one(conn, 'unused'))
+            lab.assert_called_once()
+        status = self.client.get(url).json()
+        self.assertEqual(status['status'], 'succeeded', status)
+        self.assertFalse(status['build']['manifest']['verification']['audio_negotiation_tested'])
 
     def test_failed_verification_has_no_build(self):
         rom = self.rom('06CNB03_UART_recovery.bin')

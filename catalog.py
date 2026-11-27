@@ -126,7 +126,7 @@ class Patch:
 
     def metadata(self, key, *, firmware=None, outbound=None, call_in_error=None):
         data = dict(id=key, label=self.label, platforms=list(self.platforms), experimental=True,
-                    verification_available=self.verification_available)
+                    verification_available=self.verification_available and call_in_error is None)
         if self.modem_mode is not None:
             tty_detected = firmware is not None and firmware['tty_rx_offset'] is not None
             def option(target):
@@ -156,6 +156,11 @@ class Patch:
             raise ValueError('select at least one modem target and list each target only once')
         if targets != [ModemTarget.INBOUND_NCC] and self.modem_mode not in OUTBOUND_LAB_MODES:
             raise ValueError('Bell 212A already uses stock outbound settings')
+
+    def check_verification_targets(self, targets):
+        self.check_targets(targets)
+        if not self.verification_available or ModemTarget.INBOUND_NCC not in targets:
+            raise ValueError('queued verification requires inbound_ncc; use /builds for outbound-only builds')
 
     def check_platform(self, firmware):
         if firmware['demo']:
@@ -193,4 +198,4 @@ for mode, label, platforms in (
     ('v22bis', 'V.22bis register probe (no training)', ('mtr2',)),
 ):
     PATCHES[f'modem_{mode}'] = Patch(f'{label} (lab only)', partial(build_modem_lab, mode=mode),
-                                         platforms, modem_mode=mode, verification_available=False)
+                                         platforms, modem_mode=mode)

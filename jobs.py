@@ -11,17 +11,27 @@ import sqlite3
 import ssl
 from time import sleep
 
-from .catalog import PATCHES, decode_upload
+from .catalog import OUTBOUND_LAB_MODES, PATCHES, ModemTarget, decode_upload
 from .emulator import verify
 from .archive import record_error, save_blob
+from .modem_lab import verify_candidate
 
 
 SCHEMA = '''CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY, session TEXT NOT NULL, patch TEXT NOT NULL, rings INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, build_id TEXT, error TEXT,
-    notification TEXT NOT NULL DEFAULT 'not_requested'
+    notification TEXT NOT NULL DEFAULT 'not_requested',
+    modem_targets TEXT NOT NULL DEFAULT '["inbound_ncc"]'
 ); CREATE INDEX IF NOT EXISTS jobs_status ON jobs (status, created_at);'''
+
+
+def init_jobs(conn):
+    conn.executescript(SCHEMA)
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if 'modem_targets' not in {row[1] for row in conn.execute('PRAGMA table_info(jobs)')}:
+            conn.execute('''ALTER TABLE jobs ADD COLUMN modem_targets TEXT NOT NULL DEFAULT '["inbound_ncc"]' ''')
 
 
 def store_build(conn, session_id, patches, image, manifest):
@@ -50,14 +60,14 @@ def notify(job, status):
             raise RuntimeError('SMTP recipient refused')
 
 
-def process_one(conn, emulator_url, verifier=verify):
+def process_one(conn, emulator_url, verifier=None):
     row = conn.execute('''UPDATE jobs SET status='patching', updated_at=CURRENT_TIMESTAMP
                          WHERE id=(SELECT id FROM jobs WHERE status='queued' ORDER BY created_at,rowid LIMIT 1)
-                         RETURNING id,session,patch,rings''').fetchone()
+                         RETURNING id,session,patch,rings,modem_targets''').fetchone()
     conn.commit()
     if row is None:
         return False
-    job, session, patch, rings = row
+    job, session, patch, rings, target_json = row
     phase = 'patching'
     try:
         sources = json.loads(conn.execute('SELECT sources FROM sessions WHERE id=?', (session,)).fetchone()[0])
@@ -66,13 +76,14 @@ def process_one(conn, emulator_url, verifier=verify):
         selected = PATCHES.get(patch)
         if selected is None:
             raise ValueError('unknown patch selection; submit a new job using GET /patches')
-        if not selected.verification_available:
-            raise ValueError('lab probe is not eligible for queued verification')
-        image, manifest = selected.apply(chips)
+        targets = [ModemTarget(target) for target in json.loads(target_json)]
+        selected.check_verification_targets(targets)
+        image, manifest = selected.apply(chips, targets=targets)
         with conn:
             conn.execute("UPDATE jobs SET status='verifying', updated_at=CURRENT_TIMESTAMP WHERE id=?", (job,))
         phase = 'verifying'
-        manifest['verification'] = verifier(image, manifest, rings, emulator_url)
+        check = verifier or (verify_candidate if selected.modem_mode in OUTBOUND_LAB_MODES else verify)
+        manifest['verification'] = check(image, manifest, rings, emulator_url)
         with conn:
             build = store_build(conn, session, [patch], image, manifest)
             conn.execute("UPDATE jobs SET status='succeeded', build_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",

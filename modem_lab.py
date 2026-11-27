@@ -388,12 +388,12 @@ def crc16(data):
     return crc
 
 
-def verify_ncc_transmit(emu, manifest, board):
+def verify_ncc_transmit(emu, manifest, board, rings):
     """Check native NCC transmit and receive over the emulated serial link."""
     emu.clock = emu.call('state')['board']['clockHz']
     results = []
     for mode in (2, 3):
-        cursor = scenario(emu, manifest['layout'], mode, 3, board, **modem_expectations(manifest))
+        cursor = scenario(emu, manifest['layout'], mode, rings, board, **modem_expectations(manifest))
         tx = []
         for _ in range(20):
             emu.run(100)
@@ -447,7 +447,7 @@ def verify_ncc_transmit(emu, manifest, board):
                 break
         else:
             raise ValueError('firmware did not release the call after a valid NCC CLEAR')
-        results.append(dict(rings=1 if mode == 2 else 3, frame_bytes=len(frame),
+        results.append(dict(rings=1 if mode == 2 else rings, frame_bytes=len(frame),
                             crc_valid=True, modeled_bps=modeled_bps,
                             timing_checked=board == 'mtr2', bad_clear_crc_rejected=True,
                             peer_clear_released_modem=True))
@@ -458,14 +458,14 @@ def modem_expectations(manifest):
     return {key: manifest[key] for key in ('answer_cr0', 'data_cr0', 'answer_cr1') if key in manifest}
 
 
-def verify_candidate(image, manifest, url):
+def verify_candidate(image, manifest, rings, url):
     if ModemTarget.INBOUND_NCC not in manifest['modem_targets']:
         raise ValueError('the lab verifier requires an inbound target')
-    report = verify(image, manifest, 3, url)
+    report = verify(image, manifest, rings, url)
     # Isolated subroutine test, not a TTY session. Execute the stock UART
     # enable path up to (but not including) its final interrupt-helper jump.
     emu = Emulator(url)
-    ncc_tx = verify_ncc_transmit(emu, manifest, report['board'])
+    ncc_tx = verify_ncc_transmit(emu, manifest, report['board'], rings)
     emu.call('snapshots/restore', {'name': 'patcher-boot'})
     uart = manifest['uart']
     physical = uart['setup_rom_offset']
@@ -521,7 +521,7 @@ def verify_candidate(image, manifest, url):
     return dict(report, carrier_source='emulator_injected',
                 uart_setup_executed=True, uart_cntlb=uart['answer_cntlb'],
                 stock_uart_restored=True, native_ncc_tx=ncc_tx,
-                audio_negotiation_tested=False, tty_session_tested=False)
+                audio_negotiation_tested=False, outbound_ncc_session_tested=False, tty_session_tested=False)
 
 
 def main():
@@ -546,7 +546,7 @@ def main():
         if args.modem_model is not None:
             manifest['declared_modem_model'] = args.modem_model
         if args.verify_url:
-            manifest['lab_verification'] = verify_candidate(image, manifest, args.verify_url)
+            manifest['lab_verification'] = verify_candidate(image, manifest, 3, args.verify_url)
         write_patch(args.output_dir, f'{args.roms[0].stem}_{args.mode}_lab.bin', image, manifest)
     except (ValueError, OSError) as error:
         parser.exit(1, f'{error}\n')
