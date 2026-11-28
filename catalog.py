@@ -7,6 +7,7 @@ import re
 from typing import Callable
 
 from .millennium_callin_standalone import decode_ihex, is_demo_rom, patch_discovered
+from .modem_signatures import inbound_mode, outbound_modes
 
 
 ROM_ID = re.compile(rb'(?:(?P<code>[0-9]{2}))?<(?P<edition>[A-Z0-9]{7})(?P<revision>V[0-9]+\.[0-9]+)'
@@ -21,7 +22,7 @@ TTY_RX = re.compile(
     rb'\x3e\x02\xdd\x6e\x04\x95\xc2..\x3e\x01\x32(?P=state)\xc3..'
     rb'\xdd\x7e\x04\x3c\x32..\x3e\x02\x32(?P=state)', re.S,
 )
-CALL_IN_WRAPPER = re.compile(rb'\xf5\x3a(?P<flag>..)\xfe\xa5\x20\x02\x1e[\x1a\x5a\x3a\xba]\xf1\xc3(?P<writer>..)'
+CALL_IN_WRAPPER = re.compile(rb'\xf5\x3a(?P<flag>..)\xfe\xa5\x20\x02\x1e(?P<mode>[\x1a\x5a\x3a\xba])\xf1\xc3(?P<writer>..)'
                              rb'(?P<release>\xf5\xaf\x32(?P=flag)\xf1\xc3(?P=writer))', re.S)
 
 
@@ -63,24 +64,32 @@ def identify(chips):
         edition, revision = (match[k].decode('ascii') for k in ('edition', 'revision'))
         code = match['code'].decode('ascii') if match['code'] else None
     board = None
+    mappings = []
     # MTR1 startup code can sit above the header scan window (12AAV08).
-    if len(rom) == 0x40000 and any(
-        ((m[1][0] >> 4) + m[2][0]) << 12 == 0x40000 for m in MTR1_MMU.finditer(rom)
-    ):
-        board = 'mtr1'
+    if len(rom) == 0x40000:
+        mappings = [m[1][0] for m in MTR1_MMU.finditer(rom)
+                    if ((m[1][0] >> 4) + m[2][0]) << 12 == 0x40000]
+        if mappings:
+            board = 'mtr1'
     elif len(rom) == 0x100000 and MTR2_MMU in common and rom[0xc0000:0xc0008] == MTR2_RESET:
         board = 'mtr2'
+        mappings = [MTR2_MMU[1]]
     tty_rx = TTY_RX.search(common) if board is not None else None
     banked_tty = banked_tty_receiver(rom) if board == 'mtr1' and not tty_rx else None
-    call_in = board is not None and bool(recognized_call_in(rom))
+    tty_offset = tty_rx.start() if tty_rx else banked_tty
+    tty_kind = 'native' if tty_rx else 'cnb_banked' if banked_tty is not None else None
+    wrappers = recognized_call_in(rom) if board is not None else []
+    inbound = inbound_mode(rom, board, wrappers)
+    modes = {'inbound_ncc': inbound} if inbound else {}
+    if board is not None:
+        modes.update(outbound_modes(rom, board, mappings, wrappers, tty_offset, tty_kind))
     return dict(firmware_version=edition, firmware_revision=revision,
                 terminal_type=EDITION_TYPES.get(edition),
                 terminal_type_source='archive_edition_label' if edition in EDITION_TYPES else None,
                 header_variant_code=code,
                 terminal_revision=board, version_offset=match.start('edition') if match else None,
-                tty_rx_offset=tty_rx.start() if tty_rx else banked_tty,
-                tty_rx_kind='native' if tty_rx else 'cnb_banked' if banked_tty is not None else None,
-                call_in_detected=call_in, demo=is_demo_rom(rom),
+                tty_rx_offset=tty_offset, tty_rx_kind=tty_kind,
+                call_in_detected=bool(wrappers), modem_modes_detected=modes, demo=is_demo_rom(rom),
                 image_sha256=sha256(rom).hexdigest(), image_size=len(rom))
 
 

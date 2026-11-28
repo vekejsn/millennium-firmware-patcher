@@ -69,6 +69,8 @@ Use the IDs and targets returned by the patch picker. Existing archived builds k
 
 `firmware.tty_rx_offset` gives the ROM byte offset of a recognized TTY receive routine. The outbound TTY option also requires a matching routing hook and room for the patch. `null` means the signature did not match; it does not prove that the ROM has no TTY code.
 
+`firmware.modem_modes_detected` reports known modem patch signatures by call path, for example `{"inbound_ncc":"bell212a","outbound_ncc":"bell103"}`. It reads the uploaded ROM, not build history. Missing paths mean no known patch was detected, not that the path is unavailable or running a particular stock mode. A match does not verify modem negotiation.
+
 Poll `status_url` until the job reaches `succeeded` or `failed`. On success, use `build.download_url` to fetch the ROM and `build.manifest.verification` to read the test results. A failed job returns an error and leaves the original in the archive. An interrupted job goes back into the queue when the worker restarts.
 
 The emulator boots the patched ROM and checks immediate and delayed answer, simulated carrier, and no pickup in modes 0 and 1. Lab modes also check UART selection and an inbound NCC serial exchange with a CRC-checked peer CLEAR. A job with outgoing paths selected builds those paths into the same ROM but does not test complete outgoing calls. No job verifies real audio negotiation or physical hardware. The V.22bis probe still does not implement training or fallback.
@@ -84,6 +86,8 @@ The emulator boots the patched ROM and checks immediate and delayed answer, simu
 | `source_and_patched` | The same bytes came from both an upload and a build in this group. |
 
 For `patched` and `source_and_patched`, `applied_patches` lists the distinct patch IDs recorded by builds that produced that hash in the group, for example `["modem_bell212a"]`. The list keeps historical IDs as recorded and doesn't infer patches from uploaded bytes. Entries with `source` provenance omit this field.
+
+`applied_builds` keeps the patch IDs and call paths together for each distinct build selection that produced the hash. For example, `[{"patches":["modem_bell103"],"modem_targets":["inbound_ncc","outbound_tty"]}]`. Older build records with no known targets report `modem_targets: null`; the inbound-only Bell 212A patch has a known target even in older records. Source-only entries omit `applied_builds`. The upload response can report a recognized TTY receiver or call-in patch signature, separately from archive provenance. A detected TTY receiver may be part of stock firmware.
 
 Provenance doesn't tell you whether a build passed emulator checks; check its verification report for that. Split uploads list the chip files separately. `updated_at` is when the service last saved those bytes, in UTC. Older entries may have no recorded time (`null`), and unidentified uploads have `null` for the version and revision.
 

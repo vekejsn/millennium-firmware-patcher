@@ -39,17 +39,44 @@ class FirmwareProvenance(StrEnum):
         return cls.PATCHED if patched else cls.SOURCE
 
 
+class CatalogAppliedBuild(BaseModel):
+    patches: list[str]
+    modem_targets: list[ModemTarget] | None
+
+
 class CatalogBinary(BaseModel):
     hash: str
     updated_at: str | None
     provenance: FirmwareProvenance
     applied_patches: list[str] = Field(default_factory=list)
+    applied_builds: list[CatalogAppliedBuild] = Field(default_factory=list)
 
 
 class CatalogGroup(BaseModel):
     version: str | None
     revision: str | None
     binaries: list[CatalogBinary]
+
+
+def catalog_applied_builds(records):
+    selections = set()
+    for record in records:
+        patches = tuple(record['patches'] or ())
+        targets = record['modem_targets']
+        if targets:
+            try:
+                targets = tuple(sorted({ModemTarget.INBOUND_NCC if target == 'call_in' else ModemTarget(target)
+                                        for target in targets}))
+            except ValueError:
+                targets = None
+        elif patches in (('call_in',), ('modem_bell212a',)):
+            # Both IDs only ever added inbound answering, even in older manifests.
+            targets = (ModemTarget.INBOUND_NCC,)
+        else:
+            targets = None
+        selections.add((patches, targets))
+    return [dict(patches=list(patches), modem_targets=list(targets) if targets else None)
+            for patches, targets in sorted(selections, key=lambda selection: (selection[0], selection[1] or ()))]
 
 
 class BodyLimit:
@@ -298,17 +325,18 @@ def create_app(database=None):
     def catalog_rows(digest=None):
         with connect() as conn:
             return conn.execute('''
-                WITH catalog(version, revision, sha, is_source, is_patched, patch_ids) AS (
+                WITH catalog(version, revision, sha, is_source, is_patched, build_selection) AS (
                   SELECT s.firmware_version, s.firmware_revision, json_extract(source.value, '$.sha256'), 1, 0, NULL
                     FROM sessions s, json_each(s.sources) AS source
                   UNION ALL
-                  SELECT s.firmware_version, s.firmware_revision, b.sha, 0, 1, json_extract(b.info, '$.patches')
+                  SELECT s.firmware_version, s.firmware_revision, b.sha, 0, 1,
+                         json_object('patches', json_extract(b.info, '$.patches'),
+                                     'modem_targets', json_extract(b.info, '$.manifest.modem_targets'))
                     FROM builds b JOIN sessions s ON s.id = b.session
                 )
                 SELECT version, revision, catalog.sha, blobs.updated_at, MAX(is_source), MAX(is_patched),
-                       json_group_array(DISTINCT patch.value) FILTER (WHERE patch.type = 'text')
+                       json_group_array(DISTINCT json(build_selection)) FILTER (WHERE is_patched)
                   FROM catalog JOIN blobs ON blobs.sha = catalog.sha
-                  LEFT JOIN json_each(catalog.patch_ids) AS patch ON TRUE
                  WHERE (? IS NULL OR catalog.sha = ?)
                  GROUP BY version, revision, catalog.sha, blobs.updated_at
                  ORDER BY version IS NULL, version, revision, blobs.updated_at DESC, catalog.sha
@@ -317,12 +345,14 @@ def create_app(database=None):
     @app.get('/firmwares', response_model=list[CatalogGroup], response_model_exclude_unset=True)
     def list_firmwares():
         groups = {}
-        for version, revision, digest, updated_at, source, patched, patch_ids in catalog_rows():
+        for version, revision, digest, updated_at, source, patched, selections in catalog_rows():
             group = groups.setdefault((version, revision), dict(version=version, revision=revision, binaries=[]))
             provenance = FirmwareProvenance.from_roles(source, patched)
             entry = dict(hash=digest, updated_at=updated_at, provenance=provenance)
             if patched:
-                entry['applied_patches'] = sorted(json.loads(patch_ids))
+                builds = catalog_applied_builds(json.loads(selections))
+                entry['applied_builds'] = builds
+                entry['applied_patches'] = sorted({patch for build in builds for patch in build['patches']})
             group['binaries'].append(entry)
         return list(groups.values())
 

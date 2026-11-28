@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from .api import MAX_BODY, create_app
-from .catalog import MTR2_MMU, MTR2_RESET, Patch, identify
+from .catalog import MTR2_MMU, MTR2_RESET, PATCHES, Patch, identify
 from .jobs import process_one, send_one, store_build
 from .millennium_callin_standalone import NCC_SETUP, patch_discovered
 from .modem_lab import uart_rates
@@ -308,6 +308,33 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(helper['selector'], 0x4fa0)
         self.assertLessEqual(helper['selector'] + helper['bytes'], 0x5000)
 
+    def test_detects_modem_modes_from_uploaded_code(self):
+        mtr1 = [self.rom('06CNB03.bin')]
+        mtr2 = [self.rom(f'Millennium Firmwares/NOA1X01V1.3-f{i}.BIN') for i in (0, 1)]
+        for chips, modes in ((mtr1, ('bell103',)), (mtr2, ('v21', 'v22', 'v22bis'))):
+            self.assertEqual(identify(chips)['modem_modes_detected'], {})
+            for mode in modes:
+                for targets in (['inbound_ncc'], ['outbound_ncc'], ['outbound_tty'],
+                                ['inbound_ncc', 'outbound_ncc', 'outbound_tty']):
+                    with self.subTest(mode=mode, targets=targets):
+                        image, _ = PATCHES[f'modem_{mode}'].apply(chips, targets=targets)
+                        parts = [image] if chips is mtr1 else [image[:0x80000], image[0x80000:]]
+                        self.assertEqual(identify(parts)['modem_modes_detected'], dict.fromkeys(targets, mode))
+
+        inbound, _ = PATCHES['modem_bell212a'].apply(mtr1)
+        mixed, manifest = PATCHES['modem_bell103'].apply([inbound], targets=['outbound_ncc'])
+        upload = self.upload(('unrelated-name.bin', mixed))
+        self.assertEqual(upload['firmware']['modem_modes_detected'], {
+            'inbound_ncc': 'bell212a', 'outbound_ncc': 'bell103',
+        })
+        # Matching helper bytes alone do not count if the native hooks no longer call them.
+        detached = bytearray(mixed)
+        for change in manifest['patches']:
+            if change['label'] == 'preserve_answer_modem_mode':
+                offset, old = change['offset'], bytes.fromhex(change['expected'])
+                detached[offset:offset + len(old)] = old
+        self.assertEqual(identify([bytes(detached)])['modem_modes_detected'], {'inbound_ncc': 'bell212a'})
+
     def test_mtr1_preservation_build_and_restart(self):
         rom = self.rom('06CNB03_UART_recovery.bin')
         result = self.upload(('not-the-firmware-version.bin', rom))
@@ -390,6 +417,11 @@ class ApiTest(unittest.TestCase):
             store_build(conn, session, ['call_in'], patched, {'output_sha256': patched_hash})
             store_build(conn, session, ['modem_bell212a'], patched,
                         {'output_sha256': patched_hash, 'verification': {'boot': True}})
+            for targets in (['outbound_tty', 'inbound_ncc'], ['inbound_ncc', 'outbound_tty'],
+                            ['outbound_ncc'], ['call_in', 'outbound_tty']):
+                store_build(conn, session, ['modem_bell103'], patched,
+                            {'output_sha256': patched_hash, 'modem_targets': targets})
+            store_build(conn, session, ['modem_v22'], patched, {'output_sha256': patched_hash})
 
         def catalog_roles():
             groups = self.client.get('/firmwares').json()
@@ -399,7 +431,15 @@ class ApiTest(unittest.TestCase):
             self.assertEqual(len(group['binaries']), 2)
             entries = {entry['hash']: entry for entry in group['binaries']}
             self.assertEqual(set(entries[stock_hash]), {'hash', 'updated_at', 'provenance'})
-            self.assertEqual(entries[patched_hash]['applied_patches'], ['call_in', 'modem_bell212a'])
+            self.assertEqual(entries[patched_hash]['applied_patches'],
+                             ['call_in', 'modem_bell103', 'modem_bell212a', 'modem_v22'])
+            self.assertEqual(entries[patched_hash]['applied_builds'], [
+                {'patches': ['call_in'], 'modem_targets': ['inbound_ncc']},
+                {'patches': ['modem_bell103'], 'modem_targets': ['inbound_ncc', 'outbound_tty']},
+                {'patches': ['modem_bell103'], 'modem_targets': ['outbound_ncc']},
+                {'patches': ['modem_bell212a'], 'modem_targets': ['inbound_ncc']},
+                {'patches': ['modem_v22'], 'modem_targets': None},
+            ])
             return {digest: entry['provenance'] for digest, entry in entries.items()}
 
         self.assertEqual(catalog_roles(), {stock_hash: 'source', patched_hash: 'patched'})
